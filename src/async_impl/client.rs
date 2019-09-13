@@ -17,7 +17,7 @@ use native_tls::TlsConnector;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::{clock, timer::Delay};
+use tokio::{clock, executor::Executor, timer::Delay};
 
 use log::debug;
 
@@ -84,6 +84,7 @@ struct Config {
     nodelay: bool,
     #[cfg(feature = "cookies")]
     cookie_store: Option<cookie::CookieStore>,
+    http_builder: hyper::client::Builder,
 }
 
 impl ClientBuilder {
@@ -124,6 +125,7 @@ impl ClientBuilder {
                 nodelay: false,
                 #[cfg(feature = "cookies")]
                 cookie_store: None,
+                http_builder: Default::default(),
             },
         }
     }
@@ -135,7 +137,7 @@ impl ClientBuilder {
     /// This method fails if TLS backend cannot be initialized, or the resolver
     /// cannot load the system configuration.
     pub fn build(self) -> crate::Result<Client> {
-        let config = self.config;
+        let mut config = self.config;
         let mut proxies = config.proxies;
         if config.auto_sys_proxy {
             proxies.push(Proxy::system());
@@ -214,25 +216,32 @@ impl ClientBuilder {
 
         connector.set_timeout(config.connect_timeout);
 
-        let mut builder = hyper::Client::builder();
         if config.http2_only {
-            builder.http2_only(true);
+            config.http_builder.http2_only(true);
         }
 
         if let Some(http2_initial_stream_window_size) = config.http2_initial_stream_window_size {
-            builder.http2_initial_stream_window_size(http2_initial_stream_window_size);
+            config
+                .http_builder
+                .http2_initial_stream_window_size(http2_initial_stream_window_size);
         }
-        if let Some(http2_initial_connection_window_size) = config.http2_initial_connection_window_size {
-            builder.http2_initial_connection_window_size(http2_initial_connection_window_size);
+        if let Some(http2_initial_connection_window_size) =
+            config.http2_initial_connection_window_size
+        {
+            config
+                .http_builder
+                .http2_initial_connection_window_size(http2_initial_connection_window_size);
         }
 
-        builder.max_idle_per_host(config.max_idle_per_host);
+        config
+            .http_builder
+            .max_idle_per_host(config.max_idle_per_host);
 
         if config.http1_title_case_headers {
-            builder.http1_title_case_headers(true);
+            config.http_builder.http1_title_case_headers(true);
         }
 
-        let hyper_client = builder.build(connector);
+        let hyper_client = config.http_builder.build(connector);
 
         let proxies_maybe_http_auth = proxies.iter().any(|p| p.maybe_has_http_auth());
 
@@ -299,7 +308,6 @@ impl ClientBuilder {
         }
         self
     }
-
 
     /// Enable a persistent cookie store for the client.
     ///
@@ -463,7 +471,10 @@ impl ClientBuilder {
     /// Sets the max connection-level flow control for HTTP2
     ///
     /// Default is currently 65,535 but may change internally to optimize for common uses.
-    pub fn http2_initial_connection_window_size(mut self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+    pub fn http2_initial_connection_window_size(
+        mut self,
+        sz: impl Into<Option<u32>>,
+    ) -> ClientBuilder {
         self.config.http2_initial_connection_window_size = sz.into();
         self
     }
@@ -583,7 +594,6 @@ impl ClientBuilder {
         self
     }
 
-
     /// Force using the Rustls TLS backend.
     ///
     /// Since multiple TLS backends can be optionally enabled, this option will
@@ -595,6 +605,16 @@ impl ClientBuilder {
     #[cfg(feature = "rustls-tls")]
     pub fn use_rustls_tls(mut self) -> ClientBuilder {
         self.config.tls = TlsBackend::Rustls;
+        self
+    }
+
+    /// Set the executor used for the Hyper client.
+    pub fn executor<E>(mut self, executor: E) -> ClientBuilder
+    where
+        for<'a> &'a E: Executor,
+        E: Send + Sync + 'static,
+    {
+        self.config.http_builder.executor(executor);
         self
     }
 }
@@ -937,14 +957,11 @@ impl ClientRef {
 
         f.field("default_headers", &self.headers);
 
-
         if let Some(ref d) = self.request_timeout {
             f.field("timeout", d);
         }
     }
 }
-
-
 
 pub(super) struct Pending {
     inner: PendingInner,
